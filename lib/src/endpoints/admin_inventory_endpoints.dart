@@ -1,19 +1,22 @@
 import 'package:serverpod/database.dart';
 import 'package:serverpod/protocol.dart';
 import 'package:serverpod/server.dart';
-
 import '../generated/InventoryCategory.dart';
 import '../generated/InventoryItemInfo.dart';
 import '../generated/inventory_audit_log.dart';
 import '../generated/inventory_transaction.dart';
 
-class AdminInventoryEndpoints extends Endpoint{
+import '../utils/auth_user.dart';
+
+class AdminInventoryEndpoints extends Endpoint {
+  @override
+  bool get requireLogin => true;
 
   Future<bool> addInventoryCategory(
-      Session session,
-      String name,
-      String? description,
-      ) async {
+    Session session,
+    String name,
+    String? description,
+  ) async {
     try {
       await session.db.unsafeExecute(
         '''
@@ -33,8 +36,8 @@ class AdminInventoryEndpoints extends Endpoint{
     }
   }
 
-
-  Future<List<InventoryCategory>> listInventoryCategories(Session session) async {
+  Future<List<InventoryCategory>> listInventoryCategories(
+      Session session) async {
     try {
       final result = await session.db.unsafeQuery(
         '''
@@ -58,17 +61,19 @@ class AdminInventoryEndpoints extends Endpoint{
       return [];
     }
   }
+
   Future<bool> addInventoryItem(
-      Session session, {
-        required int categoryId,
-        required String itemName,
-        required String unit,
-        required int minimumStock,
-        int initialStock = 0,
-        bool canRestockDispenser = false,
-        required int adminUserId,
-      }) async {
+    Session session, {
+    required int categoryId,
+    required String itemName,
+    required String unit,
+    required int minimumStock,
+    int initialStock = 0,
+    bool canRestockDispenser = false,
+    required int adminUserId,
+  }) async {
     try {
+      final resolvedAdminUserId = requireAuthenticatedUserId(session);
       await session.db.unsafeExecute('BEGIN');
 
       // 1️⃣ Insert item
@@ -114,7 +119,7 @@ class AdminInventoryEndpoints extends Endpoint{
         parameters: QueryParameters.named({
           'id': itemId,
           'qty': initialStock,
-          'uid': adminUserId,
+          'uid': resolvedAdminUserId,
         }),
       );
 
@@ -122,20 +127,22 @@ class AdminInventoryEndpoints extends Endpoint{
       return true;
     } catch (e, st) {
       await session.db.unsafeExecute('ROLLBACK');
-      session.log('addInventoryItem failed: $e\n$st',
-          level: LogLevel.error);
+      session.log('addInventoryItem failed: $e\n$st', level: LogLevel.error);
       return false;
     }
   }
+
   Future<bool> updateInventoryStock(
-      Session session, {
-        required int itemId,
-        required int quantity,
-        required String type, // IN or OUT
-        required int userId,
-      }) async {
+    Session session, {
+    required int itemId,
+    required int quantity,
+    required String type, // IN or OUT
+    required int userId,
+  }) async {
     try {
       if (quantity <= 0) return false;
+
+      final resolvedUserId = requireAuthenticatedUserId(session);
 
       await session.db.unsafeExecute('BEGIN');
 
@@ -155,12 +162,9 @@ class AdminInventoryEndpoints extends Endpoint{
         return false;
       }
 
-      final oldQty =
-      stockRes.first.toColumnMap()['current_quantity'] as int;
+      final oldQty = stockRes.first.toColumnMap()['current_quantity'] as int;
 
-      final int newQty = type == 'IN'
-          ? oldQty + quantity
-          : oldQty - quantity;
+      final int newQty = type == 'IN' ? oldQty + quantity : oldQty - quantity;
 
       if (newQty < 0) {
         await session.db.unsafeExecute('ROLLBACK');
@@ -193,7 +197,7 @@ class AdminInventoryEndpoints extends Endpoint{
           'id': itemId,
           't': type,
           'q': quantity,
-          'u': userId,
+          'u': resolvedUserId,
         }),
       );
 
@@ -210,7 +214,7 @@ class AdminInventoryEndpoints extends Endpoint{
           'old': oldQty,
           'new': newQty,
           'act': type == 'IN' ? 'ADD_STOCK' : 'REMOVE_STOCK',
-          'u': userId,
+          'u': resolvedUserId,
         }),
       );
 
@@ -225,12 +229,13 @@ class AdminInventoryEndpoints extends Endpoint{
   }
 
   Future<bool> updateDispenserRestockFlag(
-      Session session, {
-        required int itemId,
-        required bool canRestock,
-        required int adminUserId,
-      }) async {
+    Session session, {
+    required int itemId,
+    required bool canRestock,
+    required int adminUserId,
+  }) async {
     try {
+      final resolvedAdminUserId = requireAuthenticatedUserId(session);
       await session.db.unsafeExecute('BEGIN');
 
       // Update the flag
@@ -256,7 +261,7 @@ class AdminInventoryEndpoints extends Endpoint{
       ''',
         parameters: QueryParameters.named({
           'id': itemId,
-          'uid': adminUserId,
+          'uid': resolvedAdminUserId,
         }),
       );
 
@@ -264,17 +269,15 @@ class AdminInventoryEndpoints extends Endpoint{
       return true;
     } catch (e, st) {
       await session.db.unsafeExecute('ROLLBACK');
-      session.log('updateDispenserRestockFlag failed: $e\n$st', level: LogLevel.error);
+      session.log('updateDispenserRestockFlag failed: $e\n$st',
+          level: LogLevel.error);
       return false;
     }
   }
 
-
-  Future<List<InventoryItemInfo>> listInventoryItems(
-      Session session) async {
+  Future<List<InventoryItemInfo>> listInventoryItems(Session session) async {
     try {
-      final result = await session.db.unsafeQuery(
-          '''
+      final result = await session.db.unsafeQuery('''
       SELECT
         i.item_id,
         i.item_name,
@@ -287,8 +290,7 @@ class AdminInventoryEndpoints extends Endpoint{
       JOIN inventory_category c ON c.category_id = i.category_id
       JOIN inventory_stock s ON s.item_id = i.item_id
       ORDER BY i.item_name
-      '''
-      );
+      ''');
 
       return result.map((row) {
         final map = row.toColumnMap();
@@ -320,20 +322,19 @@ class AdminInventoryEndpoints extends Endpoint{
         );
       }).toList();
     } catch (e, st) {
-      session.log('listInventoryItems failed: $e\n$st',
-          level: LogLevel.error);
+      session.log('listInventoryItems failed: $e\n$st', level: LogLevel.error);
       return [];
     }
   }
 
-
   Future<bool> updateMinimumThreshold(
-      Session session, {
-        required int itemId,
-        required int newThreshold,
-        required int adminUserId,
-      }) async {
+    Session session, {
+    required int itemId,
+    required int newThreshold,
+    required int adminUserId,
+  }) async {
     try {
+      final resolvedAdminUserId = requireAuthenticatedUserId(session);
       await session.db.unsafeExecute('BEGIN');
 
       await session.db.unsafeExecute(
@@ -357,7 +358,7 @@ class AdminInventoryEndpoints extends Endpoint{
       ''',
         parameters: QueryParameters.named({
           'id': itemId,
-          'uid': adminUserId,
+          'uid': resolvedAdminUserId,
         }),
       );
 
@@ -370,9 +371,9 @@ class AdminInventoryEndpoints extends Endpoint{
   }
 
   Future<List<InventoryTransactionInfo>> getItemTransactions(
-      Session session,
-      int itemId,
-      ) async {
+    Session session,
+    int itemId,
+  ) async {
     try {
       final result = await session.db.unsafeQuery(
         '''
@@ -388,7 +389,7 @@ class AdminInventoryEndpoints extends Endpoint{
       return result.map((r) {
         final m = r.toColumnMap();
         return InventoryTransactionInfo(
-          itemId: m['item_id'] as int,                // ✅ Now it exists in query
+          itemId: m['item_id'] as int,
           transactionType: m['transaction_type'] as String,
           quantity: m['quantity'] as int,
           createdAt: m['created_at'] as DateTime,
@@ -400,12 +401,11 @@ class AdminInventoryEndpoints extends Endpoint{
     }
   }
 
-
   Future<List<InventoryAuditLog>> getInventoryAuditLogs(
-      Session session,
-      int limit,
-      int offset,
-      ) async {
+    Session session,
+    int limit,
+    int offset,
+  ) async {
     try {
       final result = await session.db.unsafeQuery(
         '''
@@ -436,17 +436,16 @@ class AdminInventoryEndpoints extends Endpoint{
         return InventoryAuditLog(
           id: m['audit_id'] as int,
           action: m['action'] as String,
-          oldQuantity: m['old_quantity'] as int?, // YAML এ যোগ করার পর কাজ করবে
-          newQuantity: m['new_quantity'] as int?, // YAML এ যোগ করার পর কাজ করবে
+          oldQuantity: m['old_quantity'] as int?,
+          newQuantity: m['new_quantity'] as int?,
           userName: m['user_name'] as String? ?? 'System',
-          timestamp: changedAt ?? DateTime.now(), // String এর বদলে DateTime দিন
+          timestamp: changedAt ?? DateTime.now(),
         );
       }).toList();
-
-    } catch (e) { // 'st' সরিয়ে দেওয়া হয়েছে কারণ এটি ব্যবহৃত হচ্ছিল না
+    } catch (e) {
+      //
       session.log('getInventoryAuditLogs failed: $e', level: LogLevel.error);
       return [];
     }
   }
-
 }
