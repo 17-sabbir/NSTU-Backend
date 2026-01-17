@@ -2,8 +2,6 @@ import 'dart:convert';
 import 'package:crypto/crypto.dart';
 import 'package:serverpod/serverpod.dart';
 import 'dart:async'; // added for fire-and-forget scheduling
-// added for Cloudinary uploads
-import 'cloudinary_upload.dart';
 import 'auth_endpoint.dart';
 import '../generated/protocol.dart';
 
@@ -83,12 +81,9 @@ class AdminEndpoints extends Endpoint {
   /// returns normalized form like '+88XXXXXXXXXXX' where X... is 11 digits.
   /// Returns null if invalid.
 
-
   /// Create a new user record. Expects passwordHash to already be hashed by the caller.
   Future<String> createUser(Session session, String name, String email,
       String passwordHash, String role, String? phone) async {
-
-
     final existing = await session.db.unsafeQuery(
       'SELECT email, phone FROM users WHERE email = @e OR phone = @ph LIMIT 1',
       parameters: QueryParameters.named({'e': email, 'ph': phone}),
@@ -141,12 +136,8 @@ class AdminEndpoints extends Endpoint {
   Future<String> createUserWithPassword(Session session, String name,
       String email, String password, String role, String? phone) async {
     try {
-
-
-
       final hashed = sha256.convert(utf8.encode(password)).toString();
-      final res =
-          await createUser(session, name, email, hashed, role, phone);
+      final res = await createUser(session, name, email, hashed, role, phone);
 
       final newUserId = int.tryParse(res);
       if (newUserId != null) {
@@ -178,7 +169,6 @@ class AdminEndpoints extends Endpoint {
       return 'Internal error';
     }
   }
-
 
   // ------------------ Rosters ------------------
   Future<bool> _initRostersTable(Session session) async {
@@ -485,28 +475,8 @@ class AdminEndpoints extends Endpoint {
         if (data.startsWith('http://') || data.startsWith('https://')) {
           profilePictureUrl = data;
         } else {
-          var b64 = data;
-          if (b64.contains(',')) {
-            b64 = b64.split(',').last;
-          }
-          b64 = b64.replaceAll(RegExp(r"\s+"), '');
-
-          try {
-            // রিফ্যাক্টরড অংশ: CloudinaryService কল করা
-            final String? uploadedUrl = await CloudinaryUpload.uploadFile(
-                base64Data: b64, // এখানে b64 হবে
-                folder: 'admin_uploads',
-                isPdf: false);
-
-            if (uploadedUrl == null) {
-              await session.db.unsafeExecute('ROLLBACK');
-              return 'Failed to upload profile image';
-            }
-            profilePictureUrl = uploadedUrl;
-          } catch (e) {
-            await session.db.unsafeExecute('ROLLBACK');
-            return 'Invalid profile picture data';
-          }
+          await session.db.unsafeExecute('ROLLBACK');
+          return 'Invalid profile picture URL';
         }
       }
 
@@ -566,7 +536,7 @@ class AdminEndpoints extends Endpoint {
         storedHash = '';
       } else if (ph is List<int>) {
         storedHash = String.fromCharCodes(ph);
-      }else {
+      } else {
         storedHash = ph.toString();
       }
       final currHash = sha256.convert(utf8.encode(currentPassword)).toString();
@@ -612,7 +582,7 @@ class AdminEndpoints extends Endpoint {
 
   Future<List<AuditEntry>> getAuditLogs(Session session) async {
     try {
-      final result = await session.db.unsafeQuery('''
+      final result = await session.db.unsafeQuery("""
       SELECT 
         al.audit_id, 
         al.action, 
@@ -622,10 +592,12 @@ class AdminEndpoints extends Endpoint {
         u2.name as target_name  -- যার ওপর অ্যাকশন নেওয়া হয়েছে তার নাম
       FROM audit_log al
       JOIN users u1 ON CAST(al.user_id AS bigint) = u1.user_id 
-      LEFT JOIN users u2 ON CAST(al.target_id AS bigint) = u2.user_id -- target_id থেকে নাম খোঁজা
+      LEFT JOIN users u2 ON (
+        CASE WHEN al.target_id ~ '^[0-9]+\$' THEN al.target_id::bigint END
+      ) = u2.user_id -- target_id numeric হলে নাম খোঁজা
       ORDER BY al.created_at DESC
       LIMIT 100
-      ''');
+      """);
 
       return result.map((row) {
         final map = row.toColumnMap();
@@ -642,6 +614,59 @@ class AdminEndpoints extends Endpoint {
     } catch (e, st) {
       session.log('getAuditLogs failed: $e',
           level: LogLevel.error, stackTrace: st);
+      return [];
+    }
+  }
+
+  /// Fetch recent audit logs within the last [hours] hours.
+  /// Used by Admin Dashboard Recent Activity (last 24h).
+  Future<List<AuditEntry>> getRecentAuditLogs(
+    Session session,
+    int hours,
+    int limit,
+  ) async {
+    try {
+      final safeHours = hours <= 0 ? 24 : hours.clamp(1, 168);
+      final safeLimit = limit <= 0 ? 20 : limit.clamp(1, 200);
+
+      final result = await session.db.unsafeQuery(
+        """
+      SELECT 
+        al.audit_id, 
+        al.action, 
+        al.target_id, 
+        al.created_at, 
+        u1.name as admin_name,
+        u2.name as target_name
+      FROM audit_log al
+      JOIN users u1 ON CAST(al.user_id AS bigint) = u1.user_id 
+      LEFT JOIN users u2 ON (
+        CASE WHEN al.target_id ~ '^[0-9]+\$' THEN al.target_id::bigint END
+      ) = u2.user_id
+      WHERE al.created_at >= NOW() - (@h * INTERVAL '1 hour')
+      ORDER BY al.created_at DESC
+      LIMIT @lim
+      """,
+        parameters: QueryParameters.named({'h': safeHours, 'lim': safeLimit}),
+      );
+
+      return result.map((row) {
+        final map = row.toColumnMap();
+        return AuditEntry(
+          auditId: map['audit_id'] as int,
+          action: map['action'] as String,
+          targetName:
+              map['target_name']?.toString() ?? map['target_id']?.toString(),
+          createdAt: map['created_at'] as DateTime,
+          adminName: map['admin_name']?.toString() ?? 'Unknown Admin',
+        );
+      }).toList();
+    } catch (e, st) {
+      session.log(
+        'getRecentAuditLogs failed: $e',
+        level: LogLevel.error,
+        stackTrace: st,
+      );
       return [];
     }
   }
